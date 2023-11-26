@@ -1,3 +1,4 @@
+workspace = { members = ["calibrator"] }
 [package]
 name = "home-leds"
 version = "0.1.0"
@@ -26,20 +27,20 @@ embassy-time = { version = "0.1.3", features = ["nightly"] }
 embassy-executor = { version = "=0.3.2", features = [ "nightly", "log", "executor-thread", "integrated-timers" , "arch-riscv32"] }
 embassy-net = { version = "0.2.1", features = [
     "nightly",
-    "tcp",
-    "udp",
+    "udp", "igmp",
     "dhcpv4",
     "medium-ethernet",
 ] }
 futures-util = { version = "0.3.29", default-features = false }
 log = { version = "0.4.20" }
 smart-leds = "0.3.0"
+dnsparse = "0.3.0"
 
-# [patch.crates-io]
-# embassy-sync     = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
-# embassy-time     = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
-# embassy-executor = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
-# embassy-net      = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
+[patch.crates-io]
+embassy-sync     = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
+embassy-time     = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
+embassy-net      = { git = "https://github.com/embassy-rs/embassy/", rev = "ff3baf1" }
 
 
 # atomic-waker     = { version = "1.1.2", features = ["portable-atomic"] }

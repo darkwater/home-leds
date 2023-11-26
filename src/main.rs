@@ -1,5 +1,7 @@
 #![no_std]
 #![no_main]
+#![feature(associated_type_bounds)]
+#![feature(never_type)]
 #![feature(type_alias_impl_trait)]
 
 mod ws2812_driver;
@@ -7,11 +9,19 @@ mod ws2812_driver;
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::{mem::MaybeUninit, num::Wrapping};
+use core::{
+    future::pending,
+    mem::{self, MaybeUninit},
+    num::Wrapping,
+};
 
-use embassy_executor::Spawner;
-use embassy_net::{tcp::TcpSocket, Config, Ipv4Address, Stack, StackResources};
-use embassy_time::{Duration, Timer};
+use dnsparse::{Answer, HeaderKind, QueryClass, QueryKind};
+use embassy_executor::{raw::TaskStorage, Spawner};
+use embassy_net::{
+    udp::{PacketMetadata, UdpSocket},
+    Config, IpListenEndpoint, Ipv4Address, Stack, StackResources,
+};
+use embassy_time::{Duration, Ticker, Timer};
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp32c3_hal::{
     clock::ClockControl,
@@ -25,12 +35,12 @@ use esp32c3_hal::{
     Rmt, Rng, IO,
 };
 use esp_backtrace as _;
-use esp_println::println;
 use esp_wifi::{
     initialize,
     wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState},
     EspWifiInitFor,
 };
+use futures_util::Future;
 use smart_leds::{
     brightness, gamma,
     hsv::{self, Hsv},
@@ -39,14 +49,34 @@ use smart_leds::{
 
 use crate::ws2812_driver::RmtWs2812;
 
+const LEDS: u8 = 16;
+
+fn led_position(idx: u8) -> (f32, f32) {
+    ((idx / 8) as f32 * 2., -(idx as f32 % 8.))
+}
+
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+const MDNS_ADDR: Ipv4Address = Ipv4Address::new(224, 0, 0, 251);
+const MDNS_PORT: u16 = 5353;
+
+const HEAP_SIZE: usize = 32 * 1024;
+
+macro_rules! make_static {
+    ($expr:expr) => {{
+        type T = impl Sized;
+        static mut X: MaybeUninit<T> = core::mem::MaybeUninit::<T>::uninit();
+        #[allow(unused_unsafe)]
+        let (x,) = unsafe { X.write(($expr,)) };
+        x
+    }};
+}
 
 #[global_allocator]
 static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
 
 fn init_heap() {
-    const HEAP_SIZE: usize = 32 * 1024;
     static mut HEAP: MaybeUninit<[u8; HEAP_SIZE]> = MaybeUninit::uninit();
 
     unsafe {
@@ -54,10 +84,26 @@ fn init_heap() {
     }
 }
 
+pub async fn spawn_task<F, Fut>(name: &str, f: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = !> + 'static,
+{
+    let task = Box::leak(Box::new(TaskStorage::new()));
+    log::debug!(
+        "Spawning task at {:#p} size {:}: {}",
+        task,
+        mem::size_of::<TaskStorage<Fut>>(),
+        name,
+    );
+
+    let token = task.spawn(f);
+    Spawner::for_current_executor().await.must_spawn(token);
+}
+
 #[esp32c3_hal::macros::main]
 async fn main(spawner: Spawner) -> ! {
-    #[cfg(feature = "log")]
-    esp_println::logger::init_logger(log::LevelFilter::Info);
+    esp_println::logger::init_logger_from_env();
 
     init_heap();
 
@@ -86,23 +132,33 @@ async fn main(spawner: Spawner) -> ! {
     let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0.timer0);
 
+    spawn_task("LEDs", {
+        let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+        let rmt = Rmt::new(peripherals.RMT, 20u32.MHz(), &clocks).unwrap();
+
+        || run_leds(rmt, io.pins.gpio6.into_push_pull_output())
+    })
+    .await;
+
     let config = Config::dhcpv4(Default::default());
 
     let seed = 1234; // very random, very secure seed
 
     // Init network stack
-    let stack = Box::leak(Box::new(Stack::new(
+    let stack = make_static!(Stack::new(
         wifi_interface,
         config,
-        Box::leak(Box::new(StackResources::<3>::new())),
+        make_static!(StackResources::<3>::new()),
         seed,
-    )));
+    ));
 
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(stack)).ok();
 
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
+    let rx_meta = make_static!([PacketMetadata::EMPTY; 8]);
+    let rx_buffer = make_static!([0; 1500]);
+    let tx_meta = make_static!([PacketMetadata::EMPTY; 8]);
+    let tx_buffer = make_static!([0; 1500]);
 
     loop {
         if stack.is_link_up() {
@@ -111,68 +167,91 @@ async fn main(spawner: Spawner) -> ! {
         Timer::after(Duration::from_millis(500)).await;
     }
 
-    println!("Waiting to get IP address...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("Got IP: {}", config.address);
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
+    log::info!("Waiting to get IP address...");
+    stack.wait_config_up().await;
 
-    loop {
-        Timer::after(Duration::from_millis(1_000)).await;
+    let Some(config) = stack.config_v4() else {
+        panic!("No IPv4 config");
+    };
 
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+    log::info!("Got IP: {}", config.address);
 
-        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+    let mut mdns_socket = UdpSocket::new(stack, rx_meta, rx_buffer, tx_meta, tx_buffer);
 
-        let remote_endpoint = (Ipv4Address::new(142, 250, 185, 115), 80);
-        println!("connecting...");
-        let r = socket.connect(remote_endpoint).await;
-        if let Err(e) = r {
-            println!("connect error: {:?}", e);
-            continue;
-        }
-        println!("connected!");
-        let mut buf = [0; 1024];
+    mdns_socket
+        .bind(IpListenEndpoint { addr: None, port: MDNS_PORT })
+        .unwrap();
+
+    stack.join_multicast_group(MDNS_ADDR).await.unwrap();
+
+    spawner
+        .spawn(mdns_task(mdns_socket, config.address.address()))
+        .expect("spawn mdns task");
+
+    spawn_task("Heap monitor", || async move {
         loop {
-            use embedded_io_async::Write;
-            let r = socket
-                .write_all(b"GET / HTTP/1.0\r\nHost: www.mobile-j.de\r\n\r\n")
-                .await;
-            if let Err(e) = r {
-                println!("write error: {:?}", e);
-                break;
-            }
-            let n = match socket.read(&mut buf).await {
-                Ok(0) => {
-                    println!("read EOF");
-                    break;
-                }
-                Ok(n) => n,
-                Err(e) => {
-                    println!("read error: {:?}", e);
-                    break;
-                }
-            };
-            println!("{}", core::str::from_utf8(&buf[..n]).unwrap());
+            log::debug!("Heap usage: {}, free: {}", ALLOCATOR.used(), ALLOCATOR.free());
+
+            Timer::after(Duration::from_secs(10)).await;
         }
-        Timer::after(Duration::from_millis(3000)).await;
+    })
+    .await;
 
-        break;
+    pending().await
+}
+
+#[embassy_executor::task]
+async fn mdns_task(socket: UdpSocket<'static>, address: Ipv4Address) -> ! {
+    log::debug!("Starting mDNS responder");
+
+    let mut buf = [0; 1024];
+
+    loop {
+        let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+            continue;
+        };
+
+        log::trace!("Received {} bytes from {}", n, peer);
+
+        let Ok(msg) = dnsparse::Message::parse(&mut buf[..n]) else {
+            continue;
+        };
+
+        for question in msg.questions() {
+            if question.name() == "home-leds.local" && *question.kind() == QueryKind::A {
+                log::debug!("Responding to mDNS query");
+
+                let mut buf = dnsparse::Message::BUFFER;
+
+                let mut msg = dnsparse::Message::builder(&mut buf)
+                    .header(
+                        dnsparse::Header::builder()
+                            .kind(HeaderKind::Response)
+                            .build(),
+                    )
+                    .build();
+
+                msg.add_answer(&Answer {
+                    name: question.name().clone(),
+                    kind: QueryKind::A,
+                    class: QueryClass::IN,
+                    ttl: 120,
+                    rdata: address.as_bytes(),
+                });
+
+                socket
+                    .send_to(&msg, (MDNS_ADDR, MDNS_PORT))
+                    .await
+                    .expect("send");
+            }
+        }
     }
-
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let rmt = Rmt::new(peripherals.RMT, 20_000u32.kHz(), &clocks).unwrap();
-
-    run_leds(rmt, io.pins.gpio6.into_push_pull_output()).await;
 }
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
-    println!("start connection task");
-    println!("Device capabilities: {:?}", controller.get_capabilities());
+    log::info!("start connection task");
+    log::info!("Device capabilities: {:?}", controller.get_capabilities());
     loop {
         if let WifiState::StaConnected = esp_wifi::wifi::get_wifi_state() {
             // wait until we're no longer connected
@@ -187,16 +266,16 @@ async fn connection(mut controller: WifiController<'static>) {
                 ..Default::default()
             });
             controller.set_configuration(&client_config).unwrap();
-            println!("Starting wifi");
+            log::info!("Starting wifi");
             controller.start().await.unwrap();
-            println!("Wifi started!");
+            log::info!("Wifi started!");
         }
-        println!("About to connect...");
+        log::info!("About to connect...");
 
         match controller.connect().await {
-            Ok(_) => println!("Wifi connected!"),
+            Ok(_) => log::info!("Wifi connected!"),
             Err(e) => {
-                println!("Failed to connect to wifi: {e:?}");
+                log::info!("Failed to connect to wifi: {e:?}");
                 Timer::after(Duration::from_millis(5000)).await
             }
         }
@@ -208,11 +287,7 @@ async fn net_task(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
     stack.run().await
 }
 
-async fn run_leds<P>(rmt: Rmt<'_>, pin: P) -> !
-where
-    P: Peripheral,
-    <P as Peripheral>::P: OutputPin,
-{
+async fn run_leds<P: Peripheral<P: OutputPin>>(rmt: Rmt<'static>, pin: P) -> ! {
     let channel = rmt
         .channel0
         .configure(pin, TxChannelConfig {
@@ -228,14 +303,15 @@ where
 
     let mut ws2812 = RmtWs2812::new(channel);
 
-    let mut hue = Wrapping(0);
+    let mut hue = 0.;
+
+    let mut ticker = Ticker::every(Duration::from_micros(16_666));
 
     loop {
-        Timer::after(Duration::from_millis(10)).await;
-
-        let colors = (0..8).map(|i| {
+        let colors = (0..LEDS).map(led_position).map(|(x, y)| {
+            let f = 30.;
             hsv::hsv2rgb(Hsv {
-                hue: hue.0 - i * 5,
+                hue: ((hue + (x * f) + (y * f)) % u8::MAX as f32) as u8,
                 sat: 255,
                 val: 255,
             })
@@ -246,6 +322,8 @@ where
 
         ws2812.write(colors).unwrap();
 
-        hue += Wrapping(1);
+        hue += 1.;
+
+        ticker.next().await;
     }
 }
