@@ -1,19 +1,30 @@
-use alloc::vec::Vec;
-
 use esp32c3_hal::rmt::{self, PulseCode, TxChannel};
 use smart_leds::{SmartLedsWrite, RGB8};
 
-pub struct RmtWs2812<RMT: TxChannel<N>, const N: u8> {
+pub struct RmtWs2812<RMT: TxChannel<N>, const N: u8, const LEDS: usize>
+where
+    [(); LEDS * 3 * 8]:,
+{
     rmt: Option<RMT>,
+    buffer: [PulseCode; LEDS * 3 * 8],
 }
 
-impl<RMT: TxChannel<N>, const N: u8> RmtWs2812<RMT, N> {
+impl<RMT: TxChannel<N>, const N: u8, const LEDS: usize> RmtWs2812<RMT, N, LEDS>
+where
+    [(); LEDS * 3 * 8]:,
+{
     pub fn new(rmt: RMT) -> Self {
-        Self { rmt: Some(rmt) }
+        Self {
+            rmt: Some(rmt),
+            buffer: [PulseCode::default(); _],
+        }
     }
 }
 
-impl<RMT: TxChannel<N>, const N: u8> SmartLedsWrite for RmtWs2812<RMT, N> {
+impl<RMT: TxChannel<N>, const N: u8, const LEDS: usize> SmartLedsWrite for RmtWs2812<RMT, N, LEDS>
+where
+    [(); LEDS * 3 * 8]:,
+{
     type Error = rmt::Error;
     type Color = RGB8;
 
@@ -22,10 +33,10 @@ impl<RMT: TxChannel<N>, const N: u8> SmartLedsWrite for RmtWs2812<RMT, N> {
         T: Iterator<Item = I>,
         I: Into<Self::Color>,
     {
-        let mut pulses = iterator
+        iterator
             .flat_map(|color| {
                 let color: RGB8 = color.into();
-                [color.g, color.r, color.b]
+                [color.r, color.g, color.b]
             })
             .flat_map(|byte| {
                 [
@@ -43,30 +54,25 @@ impl<RMT: TxChannel<N>, const N: u8> SmartLedsWrite for RmtWs2812<RMT, N> {
                 if bit {
                     PulseCode {
                         level1: true,
-                        length1: 80 / 5,
+                        length1: 16,
                         level2: false,
-                        length2: 45 / 5,
+                        length2: 9,
                     }
                 } else {
                     PulseCode {
                         level1: true,
-                        length1: 40 / 5,
+                        length1: 8,
                         level2: false,
-                        length2: 85 / 5,
+                        length2: 17,
                     }
                 }
             })
-            .chain(core::iter::once(PulseCode {
-                level1: true,
-                length1: 5,
-                level2: false,
-                length2: 0,
-            }))
-            .collect::<Vec<_>>();
+            .zip(self.buffer.iter_mut())
+            .for_each(|(pulse, buffer)| *buffer = pulse);
 
-        pulses.last_mut().unwrap().length2 = 0;
+        self.buffer.last_mut().unwrap().length2 = 0;
 
-        match self.rmt.take().unwrap().transmit(&pulses).wait() {
+        match self.rmt.take().unwrap().transmit(&self.buffer).wait() {
             Ok(channel) => self.rmt = Some(channel),
             Err((e, channel)) => {
                 log::error!("Error: {:?}", e);
