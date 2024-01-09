@@ -6,19 +6,22 @@
 #![feature(never_type)]
 #![feature(type_alias_impl_trait)]
 #![allow(incomplete_features)]
+//
+// TEMP
+#![allow(unused)]
 
-const LEDS: usize = 100;
+// const LEDS: usize = 100;
 
-fn led_position(idx: u8) -> (f32, f32) {
-    (idx as f32, 0.)
-    // let mut x = idx % 14;
-    // let y = idx / 14;
-    // if y % 2 == 0 {
-    //     x = 13 - x;
-    // }
+// fn led_position(idx: u8) -> (f32, f32) {
+//     (idx as f32, 0.)
+//     // let mut x = idx % 14;
+//     // let y = idx / 14;
+//     // if y % 2 == 0 {
+//     //     x = 13 - x;
+//     // }
 
-    // (x as f32, y as f32)
-}
+//     // (x as f32, y as f32)
+// }
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
@@ -41,16 +44,16 @@ use alloc::boxed::Box;
 use core::{
     future::pending,
     mem::{self, MaybeUninit},
+    num::Wrapping,
 };
 
 use dnsparse::{Answer, HeaderKind, QueryClass, QueryKind};
 use embassy_executor::{raw::TaskStorage, Spawner};
 use embassy_net::{
-    tcp::TcpSocket,
     udp::{PacketMetadata, UdpSocket},
     Config, IpListenEndpoint, Ipv4Address, Stack, StackResources,
 };
-use embassy_time::{Duration, Instant, Ticker, Timer};
+use embassy_time::{Duration, Ticker, Timer};
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp32c3_hal::{
     clock::ClockControl,
@@ -64,15 +67,31 @@ use esp32c3_hal::{
     Rmt, Rng, IO,
 };
 use esp_backtrace as _;
+use esp_hal_common::peripherals::Interrupt;
 use esp_wifi::{
     initialize,
     wifi::{WifiController, WifiDevice, WifiEvent, WifiStaDevice, WifiState},
     EspWifiInitFor,
 };
 use futures_util::Future;
-use smart_leds::{brightness, gamma, SmartLedsWrite, RGB8};
+use smart_leds::{
+    gamma,
+    hsv::{self, Hsv},
+    SmartLedsWrite, RGB8,
+};
 
 use crate::ws2812_driver::RmtWs2812;
+
+// defmt::timestamp!("{=u64:us}\t", Instant::now().as_micros());
+
+// #[defmt::panic_handler]
+// fn panic() -> ! {
+//     unsafe {
+//         loop {
+//             esp_hal_common::esp_riscv_rt::riscv::asm::wfi();
+//         }
+//     }
+// }
 
 macro_rules! make_static {
     ($expr:expr) => {{
@@ -102,7 +121,7 @@ where
 {
     let task = Box::leak(Box::new(TaskStorage::new()));
     log::debug!(
-        "Spawning task at {:#p} size {:}: {}",
+        "Spawning task at {:#p} size {}: {}",
         task,
         mem::size_of::<TaskStorage<Fut>>(),
         name,
@@ -127,6 +146,7 @@ async fn main(spawner: Spawner) -> ! {
     let timer = esp32c3_hal::timer::TimerGroup::new(peripherals.TIMG1, &clocks).timer0;
     #[cfg(target_arch = "riscv32")]
     let timer = esp32c3_hal::systimer::SystemTimer::new(peripherals.SYSTIMER).alarm0;
+
     let init = initialize(
         EspWifiInitFor::Wifi,
         timer,
@@ -142,15 +162,6 @@ async fn main(spawner: Spawner) -> ! {
 
     let timer_group0 = TimerGroup::new(peripherals.TIMG0, &clocks);
     embassy::init(&clocks, timer_group0.timer0);
-
-    // let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    // let mut pin = io.pins.gpio7.into_push_pull_output();
-    // loop {
-    //     pin.set_high().unwrap();
-    //     Timer::after(Duration::from_millis(1)).await;
-    //     pin.set_low().unwrap();
-    //     Timer::after(Duration::from_millis(1)).await;
-    // }
 
     let config = Config::dhcpv4(Default::default());
 
@@ -349,7 +360,7 @@ async fn connection(mut controller: WifiController<'static>) {
         match controller.connect().await {
             Ok(_) => log::info!("Wifi connected!"),
             Err(e) => {
-                log::info!("Failed to connect to wifi: {e:?}");
+                log::info!("Failed to connect to wifi: {:?}", e);
                 Timer::after(Duration::from_millis(5000)).await
             }
         }
@@ -381,7 +392,26 @@ async fn run_leds<P: Peripheral<P: OutputPin>>(
 
     let mut ws2812 = RmtWs2812::<_, _, 100>::new(channel);
 
-    let mut ticker = Ticker::every(Duration::from_secs(1) / 20);
+    let mut ticker = Ticker::every(Duration::from_secs(1) / 60);
+
+    let mut hue = Wrapping(0u8);
+
+    // loop {
+    //     let colors = (0..100).map(|i| {
+    //         hsv::hsv2rgb(Hsv {
+    //             hue: hue.0.wrapping_add(i as u8 * 2),
+    //             sat: 255,
+    //             val: 255,
+    //         })
+    //     });
+
+    //     let colors = gamma(colors);
+
+    //     ws2812.write(colors).unwrap();
+
+    //     hue -= Wrapping(1);
+    //     ticker.next().await;
+    // }
 
     loop {
         let mut buf = [0; 1024];
@@ -400,6 +430,8 @@ async fn run_leds<P: Peripheral<P: OutputPin>>(
 
         ws2812.write(colors).unwrap();
 
-        ticker.next().await;
+        Timer::after_millis(1).await;
+
+        // ticker.next().await;
     }
 }

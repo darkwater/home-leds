@@ -1,9 +1,7 @@
-name: Continuous Integration
+name: Firmware
 
 on:
   push:
-    paths-ignore:
-      - "**/README.md"
   pull_request:
   workflow_dispatch:
 
@@ -12,6 +10,7 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   SSID: foo
   PASSWORD: bar
+  HOSTNAME: ci
 
 jobs:
   rust-checks:

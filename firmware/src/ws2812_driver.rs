@@ -3,27 +3,24 @@ use smart_leds::{SmartLedsWrite, RGB8};
 
 pub struct RmtWs2812<RMT: TxChannel<N>, const N: u8, const LEDS: usize>
 where
-    [(); LEDS * 3 * 8]:,
+    [(); LEDS * 3 * 8 + 1]:,
 {
     rmt: Option<RMT>,
-    buffer: [PulseCode; LEDS * 3 * 8],
+    buffer: [u32; LEDS * 3 * 8 + 1],
 }
 
 impl<RMT: TxChannel<N>, const N: u8, const LEDS: usize> RmtWs2812<RMT, N, LEDS>
 where
-    [(); LEDS * 3 * 8]:,
+    [(); LEDS * 3 * 8 + 1]:,
 {
     pub fn new(rmt: RMT) -> Self {
-        Self {
-            rmt: Some(rmt),
-            buffer: [PulseCode::default(); _],
-        }
+        Self { rmt: Some(rmt), buffer: [0; _] }
     }
 }
 
 impl<RMT: TxChannel<N>, const N: u8, const LEDS: usize> SmartLedsWrite for RmtWs2812<RMT, N, LEDS>
 where
-    [(); LEDS * 3 * 8]:,
+    [(); LEDS * 3 * 8 + 1]:,
 {
     type Error = rmt::Error;
     type Color = RGB8;
@@ -54,23 +51,30 @@ where
                 if bit {
                     PulseCode {
                         level1: true,
-                        length1: 16,
+                        length1: 15,
                         level2: false,
-                        length2: 9,
+                        length2: 6,
                     }
                 } else {
                     PulseCode {
                         level1: true,
-                        length1: 8,
+                        length1: 6,
                         level2: false,
-                        length2: 17,
+                        length2: 15,
                     }
                 }
             })
+            .chain(core::iter::once(PulseCode {
+                level1: true,
+                length1: 8,
+                level2: false,
+                length2: 0,
+            }))
+            .map(Into::into)
             .zip(self.buffer.iter_mut())
             .for_each(|(pulse, buffer)| *buffer = pulse);
 
-        self.buffer.last_mut().unwrap().length2 = 0;
+        // self.buffer.last_mut().unwrap().length2 = 0;
 
         match self.rmt.take().unwrap().transmit(&self.buffer).wait() {
             Ok(channel) => self.rmt = Some(channel),

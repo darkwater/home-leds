@@ -1,0 +1,3 @@
+[esp-wifi]
+tick_rate_hz = 100
+country_code = "NL"
