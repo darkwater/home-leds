@@ -76,7 +76,11 @@ where
 
         // self.buffer.last_mut().unwrap().length2 = 0;
 
-        match self.rmt.take().unwrap().transmit(&self.buffer).wait() {
+        let rmt = self.rmt.take().unwrap();
+
+        let result = critical_section::with(|_| rmt.transmit(&self.buffer).wait());
+
+        match result {
             Ok(channel) => self.rmt = Some(channel),
             Err((e, channel)) => {
                 log::error!("Error: {:?}", e);
