@@ -2,18 +2,88 @@
 
 use std::{
     net::{ToSocketAddrs, UdpSocket},
+    ops::Mul,
+    sync::{Arc, Mutex},
     thread::sleep,
     time::{Duration, Instant},
 };
 
-const ADDR: &str = "192.168.0.119:7777";
-const LEDS: usize = 100;
+use config::builder::DefaultState;
+use home_assistant_rest::Client;
+use serde::{
+    de::{value::MapDeserializer, IntoDeserializer},
+    Deserialize,
+};
+use serde_json::Value;
 
-fn main() -> anyhow::Result<()> {
+#[derive(Clone, Deserialize)]
+struct Config {
+    address: String,
+    leds: usize,
+
+    home_assistant: HomeAssistantConfig,
+}
+
+#[derive(Clone, Deserialize)]
+struct HomeAssistantConfig {
+    url: String,
+    token: String,
+}
+
+pub struct GlobalState {
+    color: Rgb,
+}
+
+#[derive(Clone, Deserialize)]
+struct LightAttributes {
+    rgb_color: Option<[u8; 3]>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("No config dir found"))?
+        .join("home-leds/config");
+
+    let config = config::ConfigBuilder::<DefaultState>::default()
+        .add_source(config::File::with_name(config_path.to_str().unwrap()))
+        .add_source(config::Environment::with_prefix("HOME_LEDS"))
+        .build()?
+        .try_deserialize::<Config>()?;
+
     let sock = UdpSocket::bind("0.0.0.0:0")?;
-    let addr = ADDR.to_socket_addrs()?.next().unwrap();
+    let addr = config.address.to_socket_addrs()?.next().unwrap();
 
-    let mut state = [LedState::Idle; LEDS];
+    let global_state = Arc::new(Mutex::new(GlobalState { color: Rgb::BLACK }));
+
+    tokio::spawn({
+        let config = config.clone();
+        let global_state = global_state.clone();
+        async move {
+            loop {
+                let client = Client::new(&config.home_assistant.url, &config.home_assistant.token)?;
+                let api_status = client.get_api_status().await?;
+
+                if api_status.message != "API running." {
+                    println!("API is NOT running");
+                } else {
+                    let state_entity = client.get_states_of_entity("light.south").await?;
+                    let light = LightAttributes::deserialize(MapDeserializer::new(
+                        state_entity.attributes.into_iter(),
+                    ))?;
+                    let color: Rgb = light.rgb_color.unwrap_or([0, 0, 0]).into();
+                    global_state.lock().unwrap().color = color;
+                }
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+
+            #[allow(unreachable_code)]
+            Result::<(), anyhow::Error>::Ok(())
+        }
+    });
+
+    let mut state = vec![LedState::Idle; config.leds];
 
     let mut last = Instant::now();
     loop {
@@ -21,8 +91,11 @@ fn main() -> anyhow::Result<()> {
         let dt = (now - last).as_secs_f32();
         last = now;
 
-        for state in state.iter_mut() {
-            state.tick(dt);
+        {
+            let global_state = global_state.lock().unwrap();
+            for state in state.iter_mut() {
+                state.tick(dt, &global_state);
+            }
         }
 
         let buf = state
@@ -37,6 +110,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
@@ -66,35 +140,71 @@ impl From<Rgb> for [u8; 3] {
     }
 }
 
+impl From<[u8; 3]> for Rgb {
+    fn from([r, g, b]: [u8; 3]) -> Self {
+        Rgb { r, g, b }
+    }
+}
+
+impl Mul<f32> for Rgb {
+    type Output = Rgb;
+
+    fn mul(self, rhs: f32) -> Self::Output {
+        Rgb {
+            r: (self.r as f32 * rhs) as u8,
+            g: (self.g as f32 * rhs) as u8,
+            b: (self.b as f32 * rhs) as u8,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum LedState {
     Idle,
-    StarFadeIn { progress: f32, speed: f32 },
-    StarFadeOut { progress: f32, speed: f32 },
+    StarFadeIn {
+        color: Rgb,
+        progress: f32,
+        speed: f32,
+    },
+    StarFadeOut {
+        color: Rgb,
+        progress: f32,
+        speed: f32,
+    },
 }
 
 impl LedState {
-    pub fn tick(&mut self, dt: f32) {
-        match self {
+    pub fn tick(&mut self, dt: f32, global: &GlobalState) {
+        match *self {
             LedState::Idle => {
                 if rand::random::<f32>() < dt * 0.1 {
                     *self = LedState::StarFadeIn {
+                        color: global.color,
                         progress: 0.,
                         speed: rand::random::<f32>() * 0.5 + 0.5,
                     };
                 }
             }
-            LedState::StarFadeIn { progress, speed } => {
-                *progress += dt * *speed;
+            LedState::StarFadeIn {
+                color,
+                ref mut progress,
+                speed,
+            } => {
+                *progress += dt * speed;
                 if *progress >= 1. {
                     *self = LedState::StarFadeOut {
+                        color,
                         progress: 1.,
                         speed: rand::random::<f32>() * 0.9 + 0.1,
                     };
                 }
             }
-            LedState::StarFadeOut { progress, speed } => {
-                *progress -= dt * *speed;
+            LedState::StarFadeOut {
+                color: _,
+                ref mut progress,
+                speed,
+            } => {
+                *progress -= dt * speed;
                 if *progress <= 0.0 {
                     *self = LedState::Idle;
                 }
@@ -107,8 +217,16 @@ impl From<LedState> for Rgb {
     fn from(state: LedState) -> Self {
         match state {
             LedState::Idle => Rgb::BLACK,
-            LedState::StarFadeIn { progress, .. } => Rgb::grey((progress * 255.) as u8),
-            LedState::StarFadeOut { progress, .. } => Rgb::grey((progress * 255.) as u8),
+            LedState::StarFadeIn {
+                color,
+                progress,
+                speed: _,
+            } => color * progress,
+            LedState::StarFadeOut {
+                color,
+                progress,
+                speed: _,
+            } => color * progress,
         }
     }
 }
