@@ -16,6 +16,9 @@ jobs:
   rust-checks:
     name: Rust Checks
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./firmware
     strategy:
       fail-fast: false
       matrix:
